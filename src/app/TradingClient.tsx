@@ -47,6 +47,17 @@ interface Position {
 	marginMode: 'cross' | 'isolated';
 }
 
+interface OpenOrder {
+	id: string;
+	side: 'long' | 'short';
+	price: number | null;
+	amount: number;
+	filled: number;
+	remaining: number;
+	type: string;
+	timestamp: number | null;
+}
+
 export default function TradingClient({ registeredExchanges }: TradingClientProps) {
 	const [selectedExchange, setSelectedExchange] = useState<Exchange | null>(null);
 	const [balance, setBalance] = useState<number | null>(null);
@@ -55,6 +66,14 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 
 	const [positions, setPositions] = useState<Position[]>([]);
 	const [positionsLoading, setPositionsLoading] = useState(false);
+
+	const [openOrders, setOpenOrders] = useState<OpenOrder[]>([]);
+	const [openOrdersLoading, setOpenOrdersLoading] = useState(false);
+	const [cancellingOrderId, setCancellingOrderId] = useState<string | null>(null);
+
+	// 포지션 종료 감시
+	const [watchingPosition, setWatchingPosition] = useState<{ exchange: Exchange; side: 'long' | 'short' } | null>(null);
+	const [positionWatchRetry, setPositionWatchRetry] = useState(0);
 
 	const [marginMode, setMarginMode] = useState<'cross' | 'isolated' | null>(null);
 
@@ -141,6 +160,42 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 		}
 	}, []);
 
+	const fetchOpenOrders = useCallback(async (exchange: Exchange) => {
+		setOpenOrdersLoading(true);
+		try {
+			const res = await fetch(`/api/trade/open-orders?exchange=${exchange}`);
+			const json = await res.json();
+			if (!res.ok) throw new Error(json.error);
+			setOpenOrders(json.orders ?? []);
+		} catch {
+			setOpenOrders([]);
+		} finally {
+			setOpenOrdersLoading(false);
+		}
+	}, []);
+
+	const handleCancelOrder = useCallback(async (exchange: Exchange, orderId: string) => {
+		setCancellingOrderId(orderId);
+		try {
+			const res = await fetch('/api/trade/cancel-order', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ exchange, orderId }),
+			});
+			const json = await res.json();
+			if (!res.ok) throw new Error(json.error);
+			setOpenOrders((prev) => prev.filter((o) => o.id !== orderId));
+			// watchingOrder가 같은 주문이면 감시도 중단
+			setWatchingOrder((prev) => (prev?.orderId === orderId ? null : prev));
+			showToast('주문이 취소되었습니다.', 'info');
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : '주문 취소 실패';
+			showToast(msg, 'error');
+		} finally {
+			setCancellingOrderId(null);
+		}
+	}, [showToast]);
+
 	const fetchMarginMode = useCallback(async (exchange: Exchange) => {
 		try {
 			const res = await fetch(`/api/trade/margin-mode?exchange=${exchange}`);
@@ -179,20 +234,32 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 		(exchange: Exchange) => {
 			fetchBalance(exchange);
 			fetchPositions(exchange);
+			fetchOpenOrders(exchange);
 			fetchLatestTpsl(exchange);
 			fetchMarginMode(exchange);
 		},
-		[fetchBalance, fetchPositions, fetchLatestTpsl, fetchMarginMode],
+		[fetchBalance, fetchPositions, fetchOpenOrders, fetchLatestTpsl, fetchMarginMode],
 	);
 
 	const refreshAllRef = useRef(refreshAll);
 	useEffect(() => { refreshAllRef.current = refreshAll; }, [refreshAll]);
 	const showToastRef = useRef(showToast);
 	useEffect(() => { showToastRef.current = showToast; }, [showToast]);
+	const fetchBalanceRef = useRef(fetchBalance);
+	useEffect(() => { fetchBalanceRef.current = fetchBalance; }, [fetchBalance]);
+	const fetchPositionsRef = useRef(fetchPositions);
+	useEffect(() => { fetchPositionsRef.current = fetchPositions; }, [fetchPositions]);
+	const fetchOpenOrdersRef = useRef(fetchOpenOrders);
+	useEffect(() => { fetchOpenOrdersRef.current = fetchOpenOrders; }, [fetchOpenOrders]);
 
 	useEffect(() => {
+		setOpenOrders([]);
+		setWatchingPosition(null);
 		if (selectedExchange) refreshAll(selectedExchange);
 	}, [selectedExchange, refreshAll]);
+
+	// SSE 재연결 트리거
+	const [sseRetry, setSseRetry] = useState(0);
 
 	// 주문 체결 감지 — SSE
 	useEffect(() => {
@@ -211,9 +278,37 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 
 			if (data.status === 'filled') {
 				setOrderFillStatus('filled');
-				setWatchingOrder(null);
 				setOpenFill(null);
-				refreshAllRef.current(exchange);
+
+				// 체결가 기반으로 포지션 카드 즉시 구성
+				const filledPrice = data.filledPrice ?? watchingOrder.entryPrice ?? 0;
+				if (filledPrice > 0) {
+					const notional = watchingOrder.amount * watchingOrder.leverage;
+					const contracts = notional / filledPrice;
+					setPositions((prev) => {
+						const filtered = prev.filter((p) => p.side !== watchingOrder.side);
+						return [...filtered, {
+							symbol: 'BTC/USDT:USDT',
+							side: watchingOrder.side,
+							entryPrice: filledPrice,
+							notional,
+							leverage: watchingOrder.leverage,
+							contracts,
+							unrealizedPnl: 0,
+							percentage: 0,
+							marginMode: marginMode ?? 'cross',
+						}];
+					});
+				}
+
+				setWatchingOrder(null);
+				// 잔액·미체결 주문 즉시 갱신, 포지션은 백그라운드 재동기
+				fetchBalanceRef.current(exchange);
+				fetchOpenOrdersRef.current(exchange);
+				setTimeout(() => fetchPositionsRef.current(exchange), 3000);
+				// 포지션 종료 감시 시작
+				setWatchingPosition({ exchange, side: watchingOrder.side });
+				setPositionWatchRetry(0);
 				showToastRef.current('주문 체결 완료!', 'success');
 				es.close();
 			} else if (data.status === 'cancelled') {
@@ -233,24 +328,50 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 		};
 
 		es.onerror = () => {
+			// 연결 오류 시 watchingOrder를 유지한 채 3초 후 재연결
 			es.close();
-			setWatchingOrder(null);
-			setOpenFill(null);
+			setTimeout(() => setSseRetry((n) => n + 1), 3000);
 		};
 
 		return () => es.close();
-	}, [watchingOrder]);
+	}, [watchingOrder, sseRetry]);
 
-	// 미체결 주문 감지 중 포지션 1초 폴링
+	// 포지션 종료 감시 — SSE
 	useEffect(() => {
-		if (!watchingOrder) return;
-		const { exchange } = watchingOrder;
-		const iv = setInterval(() => fetchPositions(exchange, true), 1000);
-		return () => clearInterval(iv);
-	}, [watchingOrder, fetchPositions]);
+		if (!watchingPosition) return;
+
+		const { exchange, side } = watchingPosition;
+		const es = new EventSource(
+			`/api/trade/watch-position?exchange=${exchange}&side=${side}`
+		);
+
+		es.onmessage = (e) => {
+			const data = JSON.parse(e.data) as { status: 'open' | 'closed' | 'error' };
+
+			if (data.status === 'closed') {
+				setPositions((prev) => prev.filter((p) => p.side !== side));
+				setWatchingPosition(null);
+				fetchBalanceRef.current(exchange);
+				showToastRef.current('포지션이 종료되었습니다.', 'info');
+				es.close();
+			} else if (data.status === 'error') {
+				// 서버 에러 → 재연결
+				es.close();
+				setTimeout(() => setPositionWatchRetry((n) => n + 1), 5000);
+			}
+			// 'open'은 무시 (단순 생존 확인)
+		};
+
+		es.onerror = () => {
+			es.close();
+			setTimeout(() => setPositionWatchRetry((n) => n + 1), 5000);
+		};
+
+		return () => es.close();
+	}, [watchingPosition, positionWatchRetry]);
 
 	const entryNum = parseFloat(entryPrice);
-	const showTpSlSection = !isNaN(entryNum) && entryNum > 0;
+	const showTpSlSection = bbo || (!isNaN(entryNum) && entryNum > 0);
 
 	// TP direction: long→위, short→아래
 	const tpDirection = side === 'long' ? 'above' : 'below';
@@ -290,8 +411,12 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 		direction: 'above' | 'below',
 	) {
 		if (!showTpSlSection) return;
-		const price = calcPriceFromPercent(entryNum, percent, direction, leverage);
-		setState({ ...state, percent: String(percent), price: price.toFixed(1) });
+		if (bbo || isNaN(entryNum) || entryNum <= 0) {
+			setState({ ...state, percent: String(percent), price: '' });
+		} else {
+			const price = calcPriceFromPercent(entryNum, percent, direction, leverage);
+			setState({ ...state, percent: String(percent), price: price.toFixed(1) });
+		}
 	}
 
 	function handlePercentInput(
@@ -301,7 +426,9 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 		direction: 'above' | 'below',
 	) {
 		const pct = parseFloat(val);
-		if (!isNaN(pct) && showTpSlSection) {
+		if (bbo || isNaN(entryNum) || entryNum <= 0) {
+			setState({ ...state, percent: val, price: '' });
+		} else if (!isNaN(pct)) {
 			const price = calcPriceFromPercent(entryNum, pct, direction, leverage);
 			setState({ ...state, percent: val, price: price.toFixed(1) });
 		} else {
@@ -311,7 +438,7 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 
 	function handlePriceInput(state: PricePercentState, setState: (s: PricePercentState) => void, val: string) {
 		const price = parseFloat(val);
-		if (!isNaN(price) && showTpSlSection) {
+		if (!isNaN(price) && !isNaN(entryNum) && entryNum > 0) {
 			const pct = calcPercentFromPrice(entryNum, price, leverage);
 			setState({ ...state, price: val, percent: pct.toFixed(2) });
 		} else {
@@ -328,6 +455,9 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 		const tpPrice = tp.enabled && tp.price ? parseFloat(tp.price) : null;
 		const slPrice = sl.enabled && sl.price ? parseFloat(sl.price) : null;
 		const closePrice = close.enabled && close.price ? parseFloat(close.price) : null;
+		const tpPct = tp.enabled && tp.percent ? parseFloat(tp.percent) : null;
+		const slPct = sl.enabled && sl.percent ? parseFloat(sl.percent) : null;
+		const closePct = close.enabled && close.percent ? parseFloat(close.percent) : null;
 
 		try {
 			const res = await fetch('/api/trade/execute', {
@@ -342,6 +472,9 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 					tp: tpPrice,
 					sl: slPrice,
 					closePrice,
+					tpPct: bbo ? tpPct : null,
+					slPct: bbo ? slPct : null,
+					closePct: bbo ? closePct : null,
 					postOnly,
 					bbo,
 				}),
@@ -764,6 +897,7 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 									onPercentChange={(val) => handlePercentInput(tp, setTp, val, tpDirection)}
 									onPriceChange={(val) => handlePriceInput(tp, setTp, val)}
 									inputStyle={s.input}
+									priceDisabled={bbo}
 								/>
 								<PricePercentRow
 									label='SL (손절)'
@@ -775,6 +909,7 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 									onPercentChange={(val) => handlePercentInput(sl, setSl, val, slDirection)}
 									onPriceChange={(val) => handlePriceInput(sl, setSl, val)}
 									inputStyle={s.input}
+									priceDisabled={bbo}
 								/>
 							</div>
 
@@ -792,6 +927,7 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 									onPercentChange={(val) => handlePercentInput(close, setClose, val, closeDirection)}
 									onPriceChange={(val) => handlePriceInput(close, setClose, val)}
 									inputStyle={s.input}
+									priceDisabled={bbo}
 								/>
 							</div>
 						</>
@@ -816,10 +952,15 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 							</p>
 						</div>
 						<button
-							onClick={() => { setWatchingOrder(null); setOrderFillStatus(null); setOpenFill(null); }}
-							style={{ color: '#555555' }}
-							className='text-xs hover:text-white transition-colors'>
-							취소
+							onClick={async () => {
+								await handleCancelOrder(watchingOrder.exchange, watchingOrder.orderId);
+								setOrderFillStatus(null);
+								setOpenFill(null);
+							}}
+							disabled={cancellingOrderId === watchingOrder.orderId}
+							style={{ color: cancellingOrderId === watchingOrder.orderId ? '#555555' : '#f87171' }}
+							className='text-xs font-medium hover:opacity-70 transition-opacity disabled:cursor-not-allowed'>
+							{cancellingOrderId === watchingOrder.orderId ? '취소 중...' : '취소'}
 						</button>
 					</div>
 
@@ -877,6 +1018,79 @@ export default function TradingClient({ registeredExchanges }: TradingClientProp
 					<p style={{ color: '#333333' }} className='text-xs font-mono truncate'>
 						{watchingOrder.orderId}
 					</p>
+				</div>
+			)}
+
+			{/* 섹션 2-0: 미체결 주문 */}
+			{selectedExchange && (openOrdersLoading || openOrders.length > 0) && (
+				<div style={s.card} className='rounded-xl p-5 space-y-3'>
+					<div className='flex items-center justify-between'>
+						<p style={s.label} className='text-xs font-medium uppercase tracking-wider'>미체결 주문</p>
+						<button
+							onClick={() => fetchOpenOrders(selectedExchange)}
+							style={{ color: '#888888' }}
+							className='text-xs underline hover:opacity-80'>
+							새로고침
+						</button>
+					</div>
+					{openOrdersLoading ? (
+						<p style={{ color: '#888888' }} className='text-sm'>불러오는 중...</p>
+					) : (
+						<div className='space-y-2'>
+							{openOrders.map((o) => {
+								const isCancelling = cancellingOrderId === o.id;
+								return (
+									<div key={o.id} style={{ backgroundColor: '#252525', border: '1px solid #333333' }} className='rounded-lg p-3'>
+										<div className='flex items-center justify-between'>
+											<div className='flex items-center gap-2'>
+												<span
+													style={{
+														backgroundColor: o.side === 'long' ? '#16a34a' : '#dc2626',
+														color: '#ffffff',
+														fontSize: '11px',
+														padding: '2px 8px',
+														borderRadius: '4px',
+														fontWeight: 700,
+													}}>
+													{o.side === 'long' ? '롱' : '숏'}
+												</span>
+												<span style={{ color: '#888888' }} className='text-xs'>
+													{o.type}
+												</span>
+											</div>
+											<div className='flex items-center gap-3'>
+												<span style={{ color: '#f7a600' }} className='text-sm font-mono font-semibold'>
+													{o.price != null
+														? `$${o.price.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}`
+														: '시장가'}
+												</span>
+												<button
+													onClick={() => handleCancelOrder(selectedExchange, o.id)}
+													disabled={isCancelling}
+													style={{ color: isCancelling ? '#555555' : '#f87171' }}
+													className='text-xs font-medium hover:opacity-70 transition-opacity disabled:cursor-not-allowed'>
+													{isCancelling ? '취소 중...' : '취소'}
+												</button>
+											</div>
+										</div>
+										<div className='flex items-center justify-between mt-2'>
+											<span style={{ color: '#888888' }} className='text-xs font-mono'>
+												{o.amount.toFixed(4)} BTC
+											</span>
+											{o.filled > 0 && (
+												<span style={{ color: '#60a5fa' }} className='text-xs font-mono'>
+													{o.filled.toFixed(4)} 체결 / {o.remaining.toFixed(4)} 잔량
+												</span>
+											)}
+											<span style={{ color: '#555555' }} className='text-xs font-mono truncate max-w-[100px]'>
+												{o.id}
+											</span>
+										</div>
+									</div>
+								);
+							})}
+						</div>
+					)}
 				</div>
 			)}
 
@@ -1102,6 +1316,7 @@ interface PricePercentRowProps {
 	onPercentChange: (val: string) => void;
 	onPriceChange: (val: string) => void;
 	inputStyle: React.CSSProperties;
+	priceDisabled?: boolean;
 }
 
 function PricePercentRow({
@@ -1113,6 +1328,7 @@ function PricePercentRow({
 	onPercentChange,
 	onPriceChange,
 	inputStyle,
+	priceDisabled = false,
 }: PricePercentRowProps) {
 	return (
 		<div className='space-y-2'>
@@ -1178,24 +1394,25 @@ function PricePercentRow({
 						</span>
 					</div>
 
-					<span style={{ color: '#555555' }} className='text-xs'>
-						→
-					</span>
-
-					{/* 직접 가격 입력 */}
-					<div className='flex items-center gap-1'>
-						<span style={{ color: '#888888' }} className='text-xs'>
-							$
-						</span>
-						<input
-							type='number'
-							value={state.price}
-							onChange={(e) => onPriceChange(e.target.value)}
-							placeholder='가격'
-							style={{ ...inputStyle, width: '100px' }}
-							className='px-2 py-1 rounded text-xs font-mono outline-none focus:ring-1 focus:ring-yellow-500'
-						/>
-					</div>
+					{priceDisabled ? (
+						<span style={{ color: '#555555' }} className='text-xs'>BBO 체결 후 계산</span>
+					) : (
+						<>
+							<span style={{ color: '#555555' }} className='text-xs'>→</span>
+							{/* 직접 가격 입력 */}
+							<div className='flex items-center gap-1'>
+								<span style={{ color: '#888888' }} className='text-xs'>$</span>
+								<input
+									type='number'
+									value={state.price}
+									onChange={(e) => onPriceChange(e.target.value)}
+									placeholder='가격'
+									style={{ ...inputStyle, width: '100px' }}
+									className='px-2 py-1 rounded text-xs font-mono outline-none focus:ring-1 focus:ring-yellow-500'
+								/>
+							</div>
+						</>
+					)}
 				</div>
 			)}
 		</div>

@@ -1,8 +1,40 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { createExchangeInstance, getSymbol, type ExchangeId as Exchange } from '@/lib/exchange'
+import type { SupabaseClient } from '@supabase/supabase-js'
+import type { Exchange as CcxtExchange } from 'ccxt'
 
 export const dynamic = 'force-dynamic'
+
+async function placeCloseOrder(
+  supabase: SupabaseClient,
+  ex: CcxtExchange,
+  orderId: string,
+  exchange: Exchange,
+  symbol: string,
+) {
+  const { data: trade } = await supabase
+    .from('trade_history')
+    .select('side, btc_qty, close_price')
+    .eq('order_id', orderId)
+    .single()
+
+  if (!trade?.close_price) return
+
+  const closeSide = trade.side === 'long' ? 'sell' : 'buy'
+  const closeParams: Record<string, unknown> = { reduceOnly: true }
+
+  if (exchange === 'bybit') {
+    try {
+      const modeResult = await (ex as unknown as { fetchPositionMode: (s: string) => Promise<{ hedged: boolean }> }).fetchPositionMode(symbol)
+      closeParams.positionIdx = modeResult.hedged ? (trade.side === 'long' ? 1 : 2) : 0
+    } catch {
+      closeParams.positionIdx = trade.side === 'long' ? 1 : 2
+    }
+  }
+
+  await ex.createOrder(symbol, 'limit', closeSide, trade.btc_qty, trade.close_price, closeParams)
+}
 
 const VALID_EXCHANGES: Exchange[] = ['bybit', 'okx', 'binance']
 const POLL_INTERVAL_MS = 2000
@@ -72,11 +104,15 @@ export async function GET(request: NextRequest) {
 
       while (!done && Date.now() - startTime < MAX_DURATION_MS) {
         try {
-          const order = await ex.fetchOrder(orderId, symbol)
+          const order = await ex.fetchOrder(orderId, symbol, { acknowledged: true })
           errorCount = 0
 
           if (order.status === 'closed') {
-            send({ status: 'filled', filledPrice: order.average ?? order.price })
+            const filledPrice = order.average ?? order.price
+            send({ status: 'filled', filledPrice })
+
+            // Close 주문 실행 (진입 체결 후 reduce-only 주문 가능)
+            await placeCloseOrder(supabase, ex, orderId, exchange, symbol)
             break
           } else if (
             order.status === 'canceled' ||
@@ -89,10 +125,11 @@ export async function GET(request: NextRequest) {
             // 'open' — 미체결
             send({ status: 'open', filled: order.filled ?? 0, remaining: order.remaining ?? 0 })
           }
-        } catch {
+        } catch (err) {
           errorCount++
+          const message = err instanceof Error ? err.message : String(err)
           if (errorCount >= 5) {
-            send({ status: 'error' })
+            send({ status: 'error', message })
             break
           }
         }
