@@ -83,9 +83,8 @@ export async function POST(request: NextRequest) {
       const ob = await ex.fetchOrderBook(symbol, 1)
       // Long → 최우선 매수호가(bid)에 주문 (메이커, 호가창 1위)
       // Short → 최우선 매도호가(ask)에 주문 (메이커, 호가창 1위)
-      entryPrice = side === 'long'
-        ? ob.bids[0]?.[0]
-        : ob.asks[0]?.[0]
+      const rawPrice = side === 'long' ? ob.bids[0]?.[0] : ob.asks[0]?.[0]
+      entryPrice = rawPrice != null ? Number(rawPrice) : null
       if (!entryPrice) {
         return NextResponse.json({ error: 'BBO 호가 조회 실패: 호가창이 비어 있습니다.' }, { status: 500 })
       }
